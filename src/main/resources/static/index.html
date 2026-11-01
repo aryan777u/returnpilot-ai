@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ReturnPilot AI</title>
+<style>
+  :root { --bg:#f5f7fb; --card:#fff; --text:#1a2233; --muted:#5b6778; --brand:#0b57d0; --ok:#137333; --warn:#b06000; --bad:#b3261e; --line:#e1e6ef; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; background:var(--bg); color:var(--text); }
+  header { padding:20px 24px; background:var(--brand); color:#fff; }
+  header h1 { margin:0; font-size:22px; }
+  header p { margin:4px 0 0; opacity:.9; font-size:14px; }
+  main { max-width:760px; margin:24px auto; padding:0 16px; display:grid; gap:16px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:18px; }
+  label { display:block; font-weight:600; font-size:14px; margin-bottom:6px; }
+  select, textarea { width:100%; padding:10px; border:1px solid var(--line); border-radius:8px; font:inherit; }
+  textarea { min-height:90px; resize:vertical; }
+  button { background:var(--brand); color:#fff; border:0; padding:10px 18px; border-radius:8px; font:inherit; font-weight:600; cursor:pointer; }
+  button:disabled { opacity:.5; cursor:wait; }
+  button.secondary { background:#fff; color:var(--brand); border:1px solid var(--brand); }
+  button.paypal { background:#ffc439; color:#111; }
+  .row { display:flex; gap:10px; margin-top:12px; flex-wrap:wrap; align-items:center; }
+  .meta { color:var(--muted); font-size:14px; margin:8px 0 6px; }
+  .badge { display:inline-block; padding:4px 10px; border-radius:999px; font-size:13px; font-weight:700; color:#fff; }
+  .APPROVE_FULL { background:var(--ok); } .APPROVE_PARTIAL { background:var(--warn); }
+  .DENY { background:var(--bad); } .NEEDS_REVIEW { background:var(--muted); }
+  .paid { color:var(--ok); font-weight:600; font-size:14px; }
+  .amount { font-size:28px; font-weight:700; margin:10px 0 4px; }
+  .small { font-size:13px; color:var(--muted); }
+  .hidden { display:none; }
+  .receipt { border-left:4px solid var(--ok); padding-left:12px; }
+  .banner { padding:10px 14px; border-radius:8px; font-size:14px; }
+  .banner.ok { background:#e6f4ea; color:var(--ok); }
+  .banner.err { background:#fce8e6; color:var(--bad); }
+  .banner.info { background:#e8f0fe; color:var(--brand); }
+</style>
+</head>
+<body>
+<header>
+  <h1>ReturnPilot AI</h1>
+  <p>AI reviews return requests against your policy. You approve. PayPal refunds.</p>
+</header>
+<main>
+  <div id="banner" class="banner hidden"></div>
+
+  <section class="card">
+    <label for="order">Order</label>
+    <select id="order"></select>
+    <div class="meta" id="orderMeta"></div>
+    <div class="row" style="margin-top:0">
+      <span class="paid hidden" id="paidTag">&#10003; Paid via PayPal (sandbox)</span>
+      <button class="paypal hidden" id="pay">Pay with PayPal (sandbox)</button>
+    </div>
+    <p class="small hidden" id="payHint">Step 1: pay for this order as the buyer. Then request a return below.</p>
+    <label for="reason" style="margin-top:14px">Customer's return request</label>
+    <textarea id="reason" placeholder="e.g. The left earcup stopped working after two days."></textarea>
+    <div class="row"><button id="analyze">Analyze request</button></div>
+  </section>
+
+  <section class="card hidden" id="result">
+    <span class="badge" id="action"></span>
+    <div class="amount" id="amount"></div>
+    <p id="explanation"></p>
+    <p class="small" id="risk"></p>
+    <p class="small" id="source"></p>
+    <div class="row">
+      <button id="approve">Approve &amp; refund via PayPal</button>
+      <button class="secondary" id="reject">Dismiss</button>
+    </div>
+  </section>
+
+  <section class="card hidden receipt" id="receipt"></section>
+</main>
+
+<script>
+let orders = [];
+let config = { paypal:false, gemini:false };
+let decision = null;
+const $ = id => document.getElementById(id);
+
+function banner(text, kind) {
+  const b = $('banner'); b.textContent = text; b.className = 'banner ' + kind;
+}
+
+async function load() {
+  config = await (await fetch('/api/config')).json();
+  await refreshOrders();
+  const q = new URLSearchParams(location.search);
+  if (q.get('paid')) { $('order').value = q.get('paid'); showMeta();
+    banner('Payment captured in PayPal sandbox for ' + q.get('paid') + '. Now try a return request.', 'ok'); }
+  else if (q.get('cancelled')) banner('Payment cancelled.', 'info');
+  else if (q.get('error')) banner('PayPal error: ' + q.get('error'), 'err');
+  else banner((config.paypal ? 'PayPal sandbox: connected.' : 'PayPal sandbox: not configured (refunds simulated).')
+      + ' ' + (config.gemini ? 'AI: Gemini.' : 'AI: built-in rules engine.'), 'info');
+  if (location.search) history.replaceState({}, '', '/');
+}
+
+async function refreshOrders() {
+  const keep = $('order').value;
+  orders = await (await fetch('/api/orders')).json();
+  $('order').innerHTML = orders.map(o => `<option value="${o.id}">${o.id} — ${o.item}</option>`).join('');
+  if (keep) $('order').value = keep;
+  showMeta();
+}
+function current() { return orders.find(o => o.id === $('order').value); }
+function showMeta() {
+  const o = current();
+  $('orderMeta').textContent = `${o.customer} · $${o.price.toFixed(2)} · delivered ${o.deliveredDaysAgo} days ago` + (o.finalSale ? ' · FINAL SALE' : '');
+  $('paidTag').classList.toggle('hidden', !o.paid);
+  $('pay').classList.toggle('hidden', !(config.paypal && !o.paid));
+  $('payHint').classList.toggle('hidden', !(config.paypal && !o.paid));
+}
+$('order').addEventListener('change', () => { showMeta(); $('result').classList.add('hidden'); $('receipt').classList.add('hidden'); });
+
+$('pay').addEventListener('click', async () => {
+  $('pay').disabled = true;
+  try {
+    const res = await fetch('/api/pay/' + $('order').value, { method:'POST' });
+    const data = await res.json();
+    if (res.ok) { window.location = data.approveUrl; }
+    else { banner('Could not start PayPal checkout: ' + data.error, 'err'); }
+  } finally { $('pay').disabled = false; }
+});
+
+$('analyze').addEventListener('click', async () => {
+  const reason = $('reason').value.trim();
+  if (!reason) { alert('Please enter the customer request.'); return; }
+  $('analyze').disabled = true; $('analyze').textContent = 'Analyzing...';
+  $('receipt').classList.add('hidden');
+  try {
+    const res = await fetch('/api/returns/analyze', { method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ orderId: $('order').value, reason }) });
+    decision = await res.json();
+    $('action').textContent = decision.action.replace('_', ' ');
+    $('action').className = 'badge ' + decision.action;
+    $('amount').textContent = 'Refund: $' + Number(decision.refundAmount).toFixed(2);
+    $('explanation').textContent = decision.explanation;
+    $('risk').textContent = 'Risk check: ' + decision.riskNote;
+    $('source').textContent = 'Decision by: ' + (decision.source === 'gemini' ? 'Gemini AI' : 'built-in rules engine');
+    $('approve').classList.toggle('hidden', !(decision.refundAmount > 0));
+    $('result').classList.remove('hidden');
+  } finally {
+    $('analyze').disabled = false; $('analyze').textContent = 'Analyze request';
+  }
+});
+
+$('reject').addEventListener('click', () => $('result').classList.add('hidden'));
+
+$('approve').addEventListener('click', async () => {
+  $('approve').disabled = true;
+  try {
+    const res = await fetch('/api/refund', { method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ orderId: $('order').value, amount: decision.refundAmount }) });
+    const data = await res.json();
+    const box = $('receipt');
+    if (res.ok) {
+      box.innerHTML = `<strong>Refund ${data.status}</strong><p>$${Number(data.amount).toFixed(2)} refunded. Reference: ${data.refundId}</p><p class="small">Mode: ${data.mode === 'SIMULATED' ? 'Simulated (no PayPal credentials set)' : 'PayPal Sandbox'}</p>`;
+    } else {
+      box.innerHTML = `<strong>Refund failed</strong><p class="small">${data.error}</p>`;
+    }
+    box.classList.remove('hidden');
+  } finally { $('approve').disabled = false; }
+});
+
+load();
+</script>
+</body>
+</html>
